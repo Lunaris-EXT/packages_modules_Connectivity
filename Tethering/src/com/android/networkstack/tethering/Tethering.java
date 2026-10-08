@@ -112,6 +112,7 @@ import android.net.TetheredClient;
 import android.net.TetheringCallbackStartedParcel;
 import android.net.TetheringConfigurationParcel;
 import android.net.TetheringInterface;
+import android.net.TetheringManager;
 import android.net.TetheringManager.TetheringRequest;
 import android.net.Uri;
 import android.net.ip.IpServer;
@@ -156,11 +157,8 @@ import com.android.net.module.util.FrameworkConnectivityStatsLog;
 import com.android.net.module.util.HandlerUtils;
 import com.android.net.module.util.NetdUtils;
 import com.android.net.module.util.RoutingCoordinatorManager;
+import com.android.net.module.util.SdkUtil;
 import com.android.net.module.util.SharedLog;
-import com.android.networkstack.apishim.common.BluetoothPanShim;
-import com.android.networkstack.apishim.common.BluetoothPanShim.TetheredInterfaceCallbackShim;
-import com.android.networkstack.apishim.common.BluetoothPanShim.TetheredInterfaceRequestShim;
-import com.android.networkstack.apishim.common.UnsupportedApiLevelException;
 import com.android.networkstack.tethering.metrics.TetheringMetrics;
 import com.android.networkstack.tethering.metrics.TetheringStatsLog;
 import com.android.networkstack.tethering.util.InterfaceSet;
@@ -288,12 +286,12 @@ public class Tethering {
     private int mOffloadStatus = TETHER_HARDWARE_OFFLOAD_STOPPED;
 
     private EthernetManager.TetheredInterfaceRequest mEthernetIfaceRequest;
-    private TetheredInterfaceRequestShim mBluetoothIfaceRequest;
+    private TetheringManager.TetheredInterfaceRequest mBluetoothIfaceRequest;
     private String mConfiguredEthernetIface;
     private String mConfiguredBluetoothIface;
     private String mConfiguredVirtualIface;
     private EthernetCallback mEthernetCallback;
-    private TetheredInterfaceCallbackShim mBluetoothCallback;
+    private TetheringManager.TetheredInterfaceCallback mBluetoothCallback;
     private SettingsObserver mSettingsObserver;
     private BluetoothPan mBluetoothPan;
     private PanServiceListener mBluetoothPanListener;
@@ -375,7 +373,6 @@ public class Tethering {
 
         // Load tethering configuration.
         updateConfiguration();
-        mConfig.readEnableSyncSM(mContext);
 
         // Must be initialized after tethering configuration is loaded because BpfCoordinator
         // constructor needs to use the configuration.
@@ -524,24 +521,6 @@ public class Tethering {
         };
         mContext.getContentResolver().registerContentObserver(Settings.Secure.getUriFor(
                 TETHERING_ALLOW_VPN_UPSTREAMS), false, vpnSettingObserver);
-
-        NetworkRequest networkRequest = new NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build();
-        ConnectivityManager.NetworkCallback vpnConnectionObserver =
-                new ConnectivityManager.NetworkCallback() {
-            @Override
-            public void onCapabilitiesChanged(Network network,
-                    NetworkCapabilities networkCapabilities) {
-                super.onCapabilitiesChanged(network, networkCapabilities);
-                // Reconsider tethering upstream
-                mTetherMainSM.sendMessage(TetherMainSM.CMD_UPSTREAM_CHANGED);
-            }
-        };
-        final ConnectivityManager connMgr = (ConnectivityManager) mContext.getSystemService(
-                    Context.CONNECTIVITY_SERVICE);
-        connMgr.registerNetworkCallback(networkRequest, vpnConnectionObserver);
     }
 
     private class TetheringThreadExecutor implements Executor {
@@ -650,8 +629,7 @@ public class Tethering {
         if (type == TETHERING_BLUETOOTH && SdkLevel.isAtLeastT()) return;
 
         // Cannot happen: on S+, tetherableWigigRegexps is always empty.
-        if (type == TETHERING_WIGIG
-                && (SdkLevel.isAtLeastS() || !hasSystemFeature(PackageManager.FEATURE_WIFI))) {
+        if (type == TETHERING_WIGIG) {
             return;
         }
 
@@ -763,8 +741,7 @@ public class Tethering {
             if (request.isExemptFromEntitlementCheck()) {
                 mEntitlementMgr.setExemptedDownstreamType(type);
             } else {
-                mEntitlementMgr.startProvisioningIfNeeded(type,
-                        request.getShouldShowEntitlementUi());
+                mEntitlementMgr.startProvisioningIfNeeded(request);
             }
             enableTetheringInternal(true /* enabled */, request, listener);
             mTetheringMetrics.createBuilder(type, callerPkg);
@@ -1036,7 +1013,6 @@ public class Tethering {
 
     private void changeBluetoothTetheringSettings(@NonNull final BluetoothPan bluetoothPan,
             final boolean enable) {
-        final BluetoothPanShim panShim = mDeps.makeBluetoothPanShim(bluetoothPan);
         if (enable) {
             if (mBluetoothIfaceRequest != null) {
                 Log.d(TAG, "Bluetooth tethering settings already enabled");
@@ -1044,12 +1020,8 @@ public class Tethering {
             }
 
             mBluetoothCallback = new BluetoothCallback();
-            try {
-                mBluetoothIfaceRequest = panShim.requestTetheredInterface(mExecutor,
-                        mBluetoothCallback);
-            } catch (UnsupportedApiLevelException e) {
-                Log.wtf(TAG, "Use unsupported API, " + e);
-            }
+            mBluetoothIfaceRequest = bluetoothPan.requestTetheredInterface(mExecutor,
+                    mBluetoothCallback);
         } else {
             if (mBluetoothIfaceRequest == null) {
                 Log.d(TAG, "Bluetooth tethering settings already disabled");
@@ -1067,7 +1039,7 @@ public class Tethering {
 
     // BluetoothCallback is only called after T. Before T, PanService would call tether/untether to
     // notify bluetooth interface status.
-    private class BluetoothCallback implements TetheredInterfaceCallbackShim {
+    private class BluetoothCallback implements TetheringManager.TetheredInterfaceCallback {
         @Override
         public void onAvailable(String iface) {
             if (this != mBluetoothCallback) return;
@@ -1227,7 +1199,13 @@ public class Tethering {
         // NOTE: If a CMD_TETHER_REQUESTED message is already in the IpServer's queue but not yet
         // processed, this will be a no-op and it will not return an error.
         tetherState.ipServer.enable(request);
-        if (request.getRequestType() == REQUEST_TYPE_PLACEHOLDER) {
+        // NOTE: USB placeholder requests are ignored from logging due to being expected as a result
+        // of the legacy setUsbTethering API. From CINNAMON_BUN, we should not expect any more usage
+        // of setUsbTethering.
+        boolean maybeLegacySetUsbTetheringRequest =
+                request.getTetheringType() == TETHERING_USB && !SdkUtil.isAtLeast26Q2();
+        if (request.getRequestType() == REQUEST_TYPE_PLACEHOLDER
+                && !maybeLegacySetUsbTetheringRequest) {
             Log.i(TAG, "Started tethering with placeholder request: " + request);
             TetheringStatsLog.write(
                     CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
@@ -2217,7 +2195,7 @@ public class Tethering {
         protected void notifyDownstreamsOfNewUpstreamIface(InterfaceSet ifaces) {
             mCurrentUpstreamIfaceSet = ifaces;
             for (IpServer ipServer : mNotifyList) {
-                ipServer.sendMessage(IpServer.CMD_TETHER_CONNECTION_CHANGED, ifaces);
+                ipServer.processMessage(IpServer.CMD_TETHER_CONNECTION_CHANGED, ifaces);
             }
         }
 
@@ -2416,7 +2394,7 @@ public class Tethering {
                         IpServer who = (IpServer) message.obj;
                         if (VDBG) Log.d(TAG, "Tether Mode requested by " + who);
                         handleInterfaceServingStateActive(message.arg1, who);
-                        who.sendMessage(IpServer.CMD_TETHER_CONNECTION_CHANGED,
+                        who.processMessage(IpServer.CMD_TETHER_CONNECTION_CHANGED,
                                 mCurrentUpstreamIfaceSet);
                         // If there has been a change and an upstream is now
                         // desired, kick off the selection process.
@@ -2513,7 +2491,7 @@ public class Tethering {
                 switch (message.what) {
                     case EVENT_IFACE_SERVING_STATE_ACTIVE:
                         IpServer who = (IpServer) message.obj;
-                        who.sendMessage(mErrorNotification);
+                        who.processMessage(mErrorNotification);
                         break;
                     case CMD_CLEAR_ERROR:
                         mErrorNotification = TETHER_ERROR_NO_ERROR;
@@ -2528,7 +2506,7 @@ public class Tethering {
             void notify(int msgType) {
                 mErrorNotification = msgType;
                 for (IpServer ipServer : mNotifyList) {
-                    ipServer.sendMessage(msgType);
+                    ipServer.processMessage(msgType);
                 }
             }
 

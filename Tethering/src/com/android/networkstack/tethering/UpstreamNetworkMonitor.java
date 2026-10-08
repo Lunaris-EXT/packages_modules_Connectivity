@@ -50,9 +50,6 @@ import androidx.annotation.Nullable;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.SharedLog;
-import com.android.networkstack.apishim.ConnectivityManagerShimImpl;
-import com.android.networkstack.apishim.common.ConnectivityManagerShim;
-import com.android.networkstack.apishim.common.UnsupportedApiLevelException;
 import com.android.networkstack.tethering.util.PrefixUtils;
 
 import java.util.HashMap;
@@ -168,7 +165,6 @@ public class UpstreamNetworkMonitor {
             Log.wtf(TAG, "default network callback is already registered");
             return;
         }
-        ConnectivityManagerShim mCmShim = ConnectivityManagerShimImpl.newInstance(mContext);
         registerAppropriateDefaultNetworkCallback();
         if (mEntitlementMgr == null) {
             mEntitlementMgr = entitle;
@@ -221,17 +217,11 @@ public class UpstreamNetworkMonitor {
         // TODO (b/382413665): By definition, a local network cannot be the system default,
         //  because it does not provide internet capability. Figure out whether this
         //  is enforced in ConnectivityService. Or what will happen for tethering if it happens.
-        final ConnectivityManagerShim cmShim = ConnectivityManagerShimImpl.newInstance(mContext);
         if (isAllowedToUseVpnUpstreams() && SdkLevel.isAtLeastU()) {
-            try {
-                cmShim.registerDefaultNetworkCallbackForUid(Process.ROOT_UID,
-                        mDefaultNetworkCallback, mHandler);
-            } catch (UnsupportedApiLevelException e) {
-                Log.wtf(TAG, "Unexpected exception registering network callback for root UID"
-                        + " to support hotspot VPN upstreams", e);
-            }
+            cm().registerDefaultNetworkCallbackForUid(Process.ROOT_UID, mDefaultNetworkCallback,
+                    mHandler);
         } else {
-            cmShim.registerSystemDefaultNetworkCallback(mDefaultNetworkCallback, mHandler);
+            cm().registerSystemDefaultNetworkCallback(mDefaultNetworkCallback, mHandler);
         }
     }
 
