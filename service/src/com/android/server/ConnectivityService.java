@@ -4276,14 +4276,6 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
     };
 
-    private final AllowedTransportsCallback mAllowedTransportsCallback =
-            new AllowedTransportsCallback() {
-        @Override
-        public void onUidsAllowedTransportsChanged(int[] uids, long[] allowedTransports) {
-            setUidsAllowedTransports(uids, allowedTransports);
-        }
-    };
-
     private boolean shouldTrackUidsForBlockedStatusCallbacks() {
         return mDeps.isAtLeastV();
     }
